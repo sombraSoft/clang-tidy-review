@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM openroad:ubuntu22.04-dev
 
 COPY requirements.txt /requirements.txt
 

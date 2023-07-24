@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: MIT
 # See LICENSE for more information
 
-import argparse
 import fnmatch
 import itertools
 import json
@@ -18,15 +17,20 @@ import unidiff
 import yaml
 import contextlib
 import datetime
+import re
+import io
+import zipfile
 from github import Github
 from github.Requester import Requester
 from github.PaginatedList import PaginatedList
+from github.WorkflowRun import WorkflowRun
 from typing import List, Optional, TypedDict
 
 DIFF_HEADER_LINE_LENGTH = 5
 FIXES_FILE = "clang_tidy_review.yaml"
 METADATA_FILE = "clang-tidy-review-metadata.json"
 REVIEW_FILE = "clang-tidy-review-output.json"
+MAX_ANNOTATIONS = 10
 
 
 class Metadata(TypedDict):
@@ -59,10 +63,7 @@ def build_clang_tidy_warnings(
 ) -> None:
     """Run clang-tidy on the given files and save output into FIXES_FILE"""
 
-    if config_file != "":
-        config = f'-config-file="{config_file}"'
-    else:
-        config = f"-checks={clang_tidy_checks}"
+    config = config_file_or_checks(clang_tidy_binary, clang_tidy_checks, config_file)
 
     print(f"Using config: {config}")
 
@@ -83,6 +84,56 @@ def build_clang_tidy_warnings(
     print(f"Took: {end - start}")
 
 
+def clang_tidy_version(clang_tidy_binary: str):
+    try:
+        version_out = subprocess.run(
+            f"{clang_tidy_binary} --version",
+            capture_output=True,
+            shell=True,
+            check=True,
+            text=True,
+        ).stdout
+    except subprocess.CalledProcessError as e:
+        print(f"\n\nWARNING: Couldn't get clang-tidy version, error was: {e}")
+        return 0
+
+    if version := re.search(r"version (\d+)", version_out):
+        return int(version.group(1))
+
+    print(
+        f"\n\nWARNING: Couldn't get clang-tidy version number, '{clang_tidy_binary} --version' reported: {version_out}"
+    )
+    return 0
+
+
+def config_file_or_checks(
+    clang_tidy_binary: str, clang_tidy_checks: str, config_file: str
+):
+    version = clang_tidy_version(clang_tidy_binary)
+
+    # If config_file is set, use that
+    if config_file == "":
+        if pathlib.Path(".clang-tidy").exists():
+            config_file = ".clang-tidy"
+    elif not pathlib.Path(config_file).exists():
+        print(f"WARNING: Could not find specified config file '{config_file}'")
+        config_file = ""
+
+    if not config_file:
+        return f"--checks={clang_tidy_checks}"
+
+    if version >= 12:
+        return f'--config-file="{config_file}"'
+
+    if config_file != ".clang-tidy":
+        print(
+            f"\n\nWARNING: non-default config file name '{config_file}' will be ignored for "
+            "selected clang-tidy version {version}. This version expects exactly '.clang-tidy'\n"
+        )
+
+    return "--config"
+
+
 def load_clang_tidy_warnings():
     """Read clang-tidy warnings from FIXES_FILE. Can be produced by build_clang_tidy_warnings"""
     try:
@@ -95,14 +146,26 @@ def load_clang_tidy_warnings():
 class PullRequest:
     """Add some convenience functions not in PyGithub"""
 
-    def __init__(self, repo: str, pr_number: int, token: str) -> None:
-        self.repo = repo
+    def __init__(self, repo: str, pr_number: Optional[int], token: str) -> None:
+        self.repo_name = repo
         self.pr_number = pr_number
         self.token = token
 
+        # Choose API URL, default to public GitHub
+        self.api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+
         github = Github(token)
-        repo_object = github.get_repo(f"{repo}")
-        self._pull_request = repo_object.get_pull(pr_number)
+        self.repo = github.get_repo(f"{repo}")
+        self._pull_request = None
+
+    @property
+    def pull_request(self):
+        if self._pull_request is None:
+            if self.pr_number is None:
+                raise RuntimeError("Missing PR number")
+
+            self._pull_request = self.repo.get_pull(int(self.pr_number))
+        return self._pull_request
 
     def headers(self, media_type: str):
         return {
@@ -112,7 +175,7 @@ class PullRequest:
 
     @property
     def base_url(self):
-        return f"https://api.github.com/repos/{self.repo}/pulls/{self.pr_number}"
+        return f"{self.api_url}/repos/{self.repo_name}/pulls/{self.pr_number}"
 
     def get(self, media_type: str, extra: str = "") -> str:
         url = f"{self.base_url}{extra}"
@@ -144,7 +207,7 @@ class PullRequest:
 
         return PaginatedList(
             get_element,
-            self._pull_request._requester,
+            self.pull_request._requester,
             f"{self.base_url}/comments",
             None,
         )
@@ -162,7 +225,7 @@ class PullRequest:
                 print("Already posted, no need to update")
                 return
 
-        self._pull_request.create_issue_comment(body)
+        self.pull_request.create_issue_comment(body)
 
     def post_review(self, review):
         """Submit a completed review"""
@@ -191,6 +254,16 @@ class PullRequest:
 
             # Re-raise the exception, causing an error in the workflow
             raise e
+
+    def post_annotations(self, review):
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+        }
+        url = f"{self.api_url}/repos/{self.repo_name}/check-runs"
+
+        response = requests.post(url, json=review, headers=headers)
+        response.raise_for_status()
 
 
 @contextlib.contextmanager
@@ -245,7 +318,6 @@ def make_file_offset_lookup(filenames):
 
 
 def get_diagnostic_file_path(clang_tidy_diagnostic, build_dir):
-
     # Sometimes, clang-tidy gives us an absolute path, so everything is fine.
     # Sometimes however it gives us a relative path that is realtive to the
     # build directory, so we prepend that.
@@ -322,6 +394,14 @@ def collate_replacement_sets(diagnostic, offset_lookup):
     # First, make sure each replacement contains "LineNumber", and
     # "EndLineNumber" in case it spans multiple lines
     for replacement in diagnostic["Replacements"]:
+        # Sometimes, the FilePath may include ".." in "." as a path component
+        # However, file paths are stored in the offset table only after being
+        # converted to an abs path, in which case the stored path will differ
+        # from the FilePath and we'll end up looking for a path that's not in
+        # the lookup dict
+        # To fix this, we'll convert all the FilePaths to absolute paths
+        replacement["FilePath"] = os.path.abspath(replacement["FilePath"])
+
         # It's possible the replacement is needed in another file?
         # Not really sure how that could come about, but let's
         # cover our behinds in case it does happen:
@@ -474,6 +554,33 @@ def try_relative(path):
         return pathlib.Path(path).resolve()
 
 
+def fix_absolute_paths(build_compile_commands, base_dir):
+    """Update absolute paths in compile_commands.json to new location, if
+    compile_commands.json was created outside the Actions container
+    """
+
+    basedir = pathlib.Path(base_dir).resolve()
+    newbasedir = pathlib.Path(".").resolve()
+
+    if basedir == newbasedir:
+        return
+
+    print(f"Found '{build_compile_commands}', updating absolute paths")
+    # We might need to change some absolute paths if we're inside
+    # a docker container
+    with open(build_compile_commands, "r") as f:
+        compile_commands = json.load(f)
+
+    print(f"Replacing '{basedir}' with '{newbasedir}'", flush=True)
+
+    modified_compile_commands = json.dumps(compile_commands).replace(
+        str(basedir), str(newbasedir)
+    )
+
+    with open(build_compile_commands, "w") as f:
+        f.write(modified_compile_commands)
+
+
 def format_notes(notes, offset_lookup):
     """Format an array of notes into a single string"""
 
@@ -499,6 +606,9 @@ def format_notes(notes, offset_lookup):
         message = f"**{path}:{line_num}:** {note['Message']}"
         code = format_ordinary_line(source_line, line_offset)
         code_blocks += f"{message}\n{code}"
+
+    if notes:
+        code_blocks = f"<details>\n<summary>Additional context</summary>\n\n{code_blocks}\n</details>\n"
 
     return code_blocks
 
@@ -612,6 +722,19 @@ def create_review_file(
     return review
 
 
+def filter_files(diff, include: List[str], exclude: List[str]) -> List:
+    changed_files = [filename.target_file[2:] for filename in diff]
+    files = []
+    for pattern in include:
+        files.extend(fnmatch.filter(changed_files, pattern))
+        print(f"include: {pattern}, file list now: {files}")
+    for pattern in exclude:
+        files = [f for f in files if not fnmatch.fnmatch(f, pattern)]
+        print(f"exclude: {pattern}, file list now: {files}")
+
+    return files
+
+
 def create_review(
     pull_request: PullRequest,
     build_dir: str,
@@ -629,14 +752,7 @@ def create_review(
     diff = pull_request.get_pr_diff()
     print(f"\nDiff from GitHub PR:\n{diff}\n")
 
-    changed_files = [filename.target_file[2:] for filename in diff]
-    files = []
-    for pattern in include:
-        files.extend(fnmatch.filter(changed_files, pattern))
-        print(f"include: {pattern}, file list now: {files}")
-    for pattern in exclude:
-        files = [f for f in files if not fnmatch.fnmatch(f, pattern)]
-        print(f"exclude: {pattern}, file list now: {files}")
+    files = filter_files(diff, include, exclude)
 
     if files == []:
         print("No files to check!")
@@ -679,8 +795,49 @@ def create_review(
         return review
 
 
-def load_metadata() -> Metadata:
+def download_artifacts(pull: PullRequest, workflow_id: int):
+    """Attempt to automatically download the artifacts from a previous
+    run of the review Action"""
+
+    # workflow id is an input: ${{github.event.workflow_run.id }}
+    workflow: WorkflowRun = pull.repo.get_workflow_run(workflow_id)
+    # I don't understand why mypy complains about the next line!
+    for artifact in workflow.get_artifacts():
+        if artifact.name == "clang-tidy-review":
+            break
+    else:
+        # Didn't find the artefact, so bail
+        print(
+            f"Couldn't find 'clang-tidy-review' artifact for workflow '{workflow_id}'. "
+            "Available artifacts are: {list(workflow.get_artifacts())}"
+        )
+        return None, None
+
+    r = requests.get(artifact.archive_download_url, headers=pull.headers("json"))
+    if not r.ok:
+        print(
+            f"WARNING: Couldn't automatically download artifacts for workflow '{workflow_id}', response was: {r}: {r.reason}"
+        )
+        return None, None
+
+    contents = b"".join(r.iter_content())
+
+    data = zipfile.ZipFile(io.BytesIO(contents))
+    filenames = data.namelist()
+
+    metadata = (
+        json.loads(data.read(METADATA_FILE)) if METADATA_FILE in filenames else None
+    )
+    review = json.loads(data.read(REVIEW_FILE)) if REVIEW_FILE in filenames else None
+    return metadata, review
+
+
+def load_metadata() -> Optional[Metadata]:
     """Load metadata from the METADATA_FILE path"""
+
+    if not pathlib.Path(METADATA_FILE).exists():
+        print(f"WARNING: Could not find metadata file ('{METADATA_FILE}')", flush=True)
+        return None
 
     with open(METADATA_FILE, "r") as metadata_file:
         return json.load(metadata_file)
@@ -701,12 +858,13 @@ def load_review() -> Optional[PRReview]:
 
     """
 
+    if not pathlib.Path(REVIEW_FILE).exists():
+        print(f"WARNING: Could not find review file ('{REVIEW_FILE}')", flush=True)
+        return None
+
     with open(REVIEW_FILE, "r") as review_file:
         payload = json.load(review_file)
-        if payload:
-            return payload
-
-        return None
+        return payload or None
 
 
 def get_line_ranges(diff, files):
@@ -782,6 +940,17 @@ def strip_enclosing_quotes(string: str) -> str:
     return stripped
 
 
+def set_output(key: str, val: str) -> bool:
+    if "GITHUB_OUTPUT" not in os.environ:
+        return False
+
+    # append key-val pair to file
+    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+        f.write(f"{key}={val}\n")
+
+    return True
+
+
 def post_review(
     pull_request: PullRequest,
     review: Optional[PRReview],
@@ -799,9 +968,9 @@ def post_review(
             pull_request.post_lgtm_comment(lgtm_comment_body)
         return 0
 
-    print(f"::set-output name=total_comments::{len(review['comments'])}")
-
     total_comments = len(review["comments"])
+
+    set_output("total_comments", total_comments)
 
     print("Removing already posted or extra comments", flush=True)
     trimmed_review = cull_comments(pull_request, review, max_comments)
@@ -818,3 +987,64 @@ def post_review(
     pull_request.post_review(trimmed_review)
 
     return total_comments
+
+
+def convert_comment_to_annotations(comment):
+    return {
+        "path": comment["path"],
+        "start_line": comment.get("start_line", comment["line"]),
+        "end_line": comment["line"],
+        "annotation_level": "warning",
+        "title": "clang-tidy",
+        "message": comment["body"],
+    }
+
+
+def post_annotations(pull_request: PullRequest, review: Optional[PRReview]):
+    """Post the first 10 comments in the review as annotations"""
+
+    body = {
+        "name": "clang-tidy-review",
+        "head_sha": pull_request.pull_request.head.sha,
+        "status": "completed",
+        "conclusion": "success",
+    }
+
+    if review is None:
+        return
+
+    if review["comments"] == []:
+        print("No warnings to report, LGTM!")
+        pull_request.post_annotations(body)
+
+    comments = []
+    for comment in review["comments"]:
+        first_line = comment["body"].splitlines()[0]
+        comments.append(
+            f"{comment['path']}:{comment.get('start_line', comment['line'])}: {first_line}"
+        )
+
+    total_comments = len(review["comments"])
+
+    body["conclusion"] = "neutral"
+    body["output"] = {
+        "title": "clang-tidy-review",
+        "summary": f"There were {total_comments} warnings",
+        "text": "\n".join(comments),
+        "annotations": [
+            convert_comment_to_annotations(comment)
+            for comment in review["comments"][:MAX_ANNOTATIONS]
+        ],
+    }
+
+    pull_request.post_annotations(body)
+
+
+def bool_argument(user_input) -> bool:
+    """Convert text to bool"""
+    user_input = str(user_input).upper()
+    if user_input == "TRUE":
+        return True
+    if user_input == "FALSE":
+        return False
+    raise ValueError("Invalid value passed to bool_argument")

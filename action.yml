@@ -18,8 +18,8 @@ inputs:
     default: ${{ github.workspace }}
     require: false
   clang_tidy_version:
-    description: 'Version of clang-tidy to use; one of 11, 12, 13, 14'
-    default: '14'
+    description: 'Version of clang-tidy to use; one of 11, 12, 13, 14, 15'
+    default: '15'
     required: false
   clang_tidy_checks:
     description: 'List of checks'
@@ -57,6 +57,10 @@ inputs:
     description: "Only generate but don't post the review, leaving it for the second workflow. Relevant when receiving PRs from forks that don't have the required permissions to post reviews."
     required: false
     default: false
+  annotations:
+    description: "Use annotations instead of comments. See README for limitations on annotations"
+    required: false
+    default: false
   pr:
     default: ${{ github.event.pull_request.number }}
   repo:
@@ -80,5 +84,7 @@ runs:
     - --exclude='${{ inputs.exclude }}'
     - --apt-packages=${{ inputs.apt_packages }}
     - --cmake-command='${{ inputs.cmake_command }}'
+    - --max-comments=${{ inputs.max_comments }}
     - --lgtm-comment-body='${{ inputs.lgtm_comment_body }}'
     - --split_workflow=${{ inputs.split_workflow }}
+    - --annotations=${{ inputs.annotations }}

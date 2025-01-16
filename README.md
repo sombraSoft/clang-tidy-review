@@ -32,15 +32,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     # Optionally generate compile_commands.json
 
-    - uses: ZedThree/clang-tidy-review@v0.12.0
+    - uses: ZedThree/clang-tidy-review@v0.14.0
       id: review
 
     # Uploads an artefact containing clang_fixes.json
-    - uses: ZedThree/clang-tidy-review/upload@v0.12.0
+    - uses: ZedThree/clang-tidy-review/upload@v0.14.0
       id: upload-review
 
     # If there are any comments, fail the check
@@ -88,13 +88,12 @@ at once, so `clang-tidy-review` will only attempt to post the first
 - `base_dir`: Absolute path to initial working directory
   `GITHUB_WORKSPACE`.
   - default: `GITHUB_WORKSPACE`
-- `clang_tidy_version`: Version of clang-tidy to use; one of 11, 12,
-  13, 14, 15
-  - default: '15'
+- `clang_tidy_version`: Version of clang-tidy to use; one of 14, 15, 16, 17, 18
+  - default: '18'
 - `clang_tidy_checks`: List of checks
   - default: `'-*,performance-*,readability-*,bugprone-*,clang-analyzer-*,cppcoreguidelines-*,mpi-*,misc-*'`
 - `config_file`: Path to clang-tidy config file, replaces `clang_tidy_checks`
-  - default: `.clang-tidy` if it already exists, otherwise ''
+  - default: '' which will use `clang_tidy_checks` if there are any, else closest `.clang-tidy` to each file
 - `include`: Comma-separated list of files or patterns to include
   - default: `"*.[ch],*.[ch]xx,*.[ch]pp,*.[ch]++,*.cc,*.hh"`
 - `exclude`: Comma-separated list of files or patterns to exclude
@@ -117,12 +116,13 @@ at once, so `clang-tidy-review` will only attempt to post the first
 - `annotations`: Use Annotations instead of comments. A maximum of 10
   annotations can be written fully, the rest will be summarised. This is a
   limitation of the GitHub API.
+- `num_comments_as_exitcode`: Set the exit code to be the amount of comments (enabled by default).
 
 ## Outputs
 
 - `total_comments`: Total number of warnings from clang-tidy
 
-## Generating `compile_commands.json` inside the container
+## Generating `compile_commands.json`
 
 Very simple projects can get away without a `compile_commands.json`
 file, but for most projects `clang-tidy` needs this file in order to
@@ -143,9 +143,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-    - uses: ZedThree/clang-tidy-review@v0.12.0
+    - uses: ZedThree/clang-tidy-review@v0.14.0
       id: review
       with:
         # List of packages to install
@@ -156,6 +156,10 @@ jobs:
 
 If you don't use CMake, this may still work for you if you can use a
 tool like [bear](https://github.com/rizsotto/Bear) for example.
+
+You can also generate this file outside the container, e.g. by adding
+`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` to a cmake command in an earlier
+action and omitting the `cmake_command` paramter.
 
 ## Use in a non-default location
 
@@ -191,14 +195,14 @@ jobs:
       image: my-container
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     # Get the current working directory and set it
     # as an environment variable
     - name: Set base_dir
       run: echo "base_dir=$(pwd)" >> $GITHUB_ENV
 
-    - uses: ZedThree/clang-tidy-review@v0.12.0
+    - uses: ZedThree/clang-tidy-review@v0.14.0
       id: review
       with:
         # Tell clang-tidy-review the base directory.
@@ -225,15 +229,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     # Optionally generate compile_commands.json
 
-    - uses: ZedThree/clang-tidy-review@v0.12.0
+    - uses: ZedThree/clang-tidy-review@v0.14.0
       with:
         split_workflow: true
 
-    - uses: ZedThree/clang-tidy-review/upload@v0.12.0
+    - uses: ZedThree/clang-tidy-review/upload@v0.14.0
 ```
 The `clang-tidy-review/upload` Action will automatically upload the following
 files as workflow artefacts:
@@ -259,7 +263,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: ZedThree/clang-tidy-review/post@v0.12.0
+      - uses: ZedThree/clang-tidy-review/post@v0.14.0
         # lgtm_comment_body, max_comments, and annotations need to be set on the posting workflow in a split setup
         with:
           # adjust options as necessary

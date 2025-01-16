@@ -6,22 +6,24 @@
 # See LICENSE for more information
 
 import argparse
-import os
 import re
 import subprocess
+from pathlib import Path
 
 from clang_tidy_review import (
     PullRequest,
+    add_auth_arguments,
+    bool_argument,
     create_review,
     fix_absolute_paths,
+    get_auth_from_arguments,
     message_group,
+    post_annotations,
     post_review,
     save_metadata,
+    set_output,
     strip_enclosing_quotes,
-    post_annotations,
-    bool_argument,
 )
-
 
 BAD_CHARS_APT_PACKAGES_PATTERN = "[;&|($]"
 
@@ -33,7 +35,10 @@ def main():
     parser.add_argument("--repo", help="Repo name in form 'owner/repo'")
     parser.add_argument("--pr", help="PR number", type=int)
     parser.add_argument(
-        "--clang_tidy_binary", help="clang-tidy binary", default="clang-tidy-14"
+        "--clang_tidy_binary",
+        help="clang-tidy binary",
+        default="clang-tidy-14",
+        type=Path,
     )
     parser.add_argument(
         "--build_dir", help="Directory with compile_commands.json", default="."
@@ -105,10 +110,17 @@ def main():
         type=bool_argument,
         default=False,
     )
-    parser.add_argument("--token", help="github auth token")
+    parser.add_argument(
+        "-j",
+        "--parallel",
+        help="Number of tidy instances to be run in parallel.",
+        type=int,
+        default=0,
+    )
     parser.add_argument(
         "--dry-run", help="Run and generate review, but don't post", action="store_true"
     )
+    add_auth_arguments(parser)
 
     args = parser.parse_args()
 
@@ -125,7 +137,7 @@ def main():
         with message_group(f"Installing additional packages: {apt_packages}"):
             subprocess.run(["apt-get", "update"], check=True)
             subprocess.run(
-                ["apt-get", "install", "-y", "--no-install-recommends"] + apt_packages,
+                ["apt-get", "install", "-y", "--no-install-recommends", *apt_packages],
                 check=True,
             )
 
@@ -139,10 +151,10 @@ def main():
         with message_group(f"Running cmake: {cmake_command}"):
             subprocess.run(cmake_command, shell=True, check=True)
 
-    elif os.path.exists(build_compile_commands):
+    elif Path(build_compile_commands).exists():
         fix_absolute_paths(build_compile_commands, args.base_dir)
 
-    pull_request = PullRequest(args.repo, args.pr, args.token)
+    pull_request = PullRequest(args.repo, args.pr, get_auth_from_arguments(args))
 
     review = create_review(
         pull_request,
@@ -150,6 +162,7 @@ def main():
         args.clang_tidy_checks,
         args.clang_tidy_binary,
         args.config_file,
+        args.parallel,
         include,
         exclude,
     )
@@ -158,6 +171,8 @@ def main():
         save_metadata(args.pr)
 
     if args.split_workflow:
+        total_comments = 0 if review is None else len(review["comments"])
+        set_output("total_comments", str(total_comments))
         print("split_workflow is enabled, not posting review")
         return
 

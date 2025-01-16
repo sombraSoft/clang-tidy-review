@@ -1,3 +1,5 @@
+import datetime
+
 import clang_tidy_review as ctr
 
 import difflib
@@ -8,6 +10,8 @@ import textwrap
 import unidiff
 
 import pytest
+
+from pathlib import Path
 
 TEST_DIR = pathlib.Path(__file__).parent
 TEST_FILE = TEST_DIR / "src/hello.cxx"
@@ -189,7 +193,7 @@ def test_fix_absolute_paths(tmp_path):
 
 
 def test_save_load_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(ctr, "METADATA_FILE", str(tmp_path / ctr.METADATA_FILE))
+    monkeypatch.setattr(ctr, "METADATA_FILE", tmp_path / ctr.METADATA_FILE)
 
     ctr.save_metadata(42)
     meta = ctr.load_metadata()
@@ -231,14 +235,12 @@ def test_filter_files():
 def test_line_ranges():
     line_ranges = ctr.get_line_ranges(TEST_DIFF, ["src/hello.cxx"])
 
-    expected_line_ranges = """["{'name': 'src/hello.cxx', 'lines': [[5, 16]]}"]"""
+    expected_line_ranges = '[{"name":"src/hello.cxx","lines":[[5,16]]}]'
     assert line_ranges == expected_line_ranges
 
 
-def test_load_clang_tidy_warnings(monkeypatch):
-    monkeypatch.setattr(ctr, "FIXES_FILE", str(TEST_DIR / f"src/test_{ctr.FIXES_FILE}"))
-
-    warnings = ctr.load_clang_tidy_warnings()
+def test_load_clang_tidy_warnings():
+    warnings = ctr.load_clang_tidy_warnings(TEST_DIR / f"src/test_{ctr.FIXES_FILE}")
 
     assert sorted(list(warnings.keys())) == ["Diagnostics", "MainSourceFile"]
     assert warnings["MainSourceFile"] == "/clang_tidy_review/src/hello.cxx"
@@ -391,7 +393,7 @@ def test_version(monkeypatch):
         lambda *args, **kwargs: MockClangTidyVersionProcess(expected_version),
     )
 
-    version = ctr.clang_tidy_version("not-clang-tidy")
+    version = ctr.clang_tidy_version(Path("not-clang-tidy"))
     assert version == expected_version
 
 
@@ -399,26 +401,78 @@ def test_config_file(monkeypatch, tmp_path):
     # Mock out the actual call so this test doesn't depend on a
     # particular version of clang-tidy being installed
     monkeypatch.setattr(
-        ctr.subprocess, "run", lambda *args, **kwargs: MockClangTidyVersionProcess(12)
+        ctr.subprocess, "run", lambda *args, **kwargs: MockClangTidyVersionProcess(15)
     )
 
     config_file = tmp_path / ".clang-tidy"
-    config_file.touch()
 
-    flag = ctr.config_file_or_checks("not-clang-tidy", "readability", str(config_file))
-    assert flag == f'--config-file="{config_file}"'
-
-    os.chdir(tmp_path)
-    flag = ctr.config_file_or_checks("not-clang-tidy", "readability", "")
-    assert flag == '--config-file=".clang-tidy"'
-
-    monkeypatch.setattr(
-        ctr.subprocess, "run", lambda *args, **kwargs: MockClangTidyVersionProcess(11)
+    # If you set clang_tidy_checks to something and config_file to something, config_file is sent to clang-tidy.
+    flag = ctr.config_file_or_checks(
+        Path("not-clang-tidy"),
+        clang_tidy_checks="readability",
+        config_file=str(config_file),
     )
-    flag = ctr.config_file_or_checks("not-clang-tidy", "readability", "")
-    assert flag == "--config"
+    assert flag == f"--config-file={config_file}"
 
-    config_file.unlink()
+    # If you set clang_tidy_checks and config_file to an empty string, neither are sent to the clang-tidy.
+    flag = ctr.config_file_or_checks(
+        Path("not-clang-tidy"), clang_tidy_checks="", config_file=""
+    )
+    assert flag is None
 
-    flag = ctr.config_file_or_checks("not-clang-tidy", "readability", "")
+    # If you get config_file to something, config_file is sent to clang-tidy.
+    flag = ctr.config_file_or_checks(
+        Path("not-clang-tidy"), clang_tidy_checks="", config_file=str(config_file)
+    )
+    assert flag == f"--config-file={config_file}"
+
+    # If you get clang_tidy_checks to something and config_file to nothing, clang_tidy_checks is sent to clang-tidy.
+    flag = ctr.config_file_or_checks(
+        Path("not-clang-tidy"), clang_tidy_checks="readability", config_file=""
+    )
     assert flag == "--checks=readability"
+
+
+def test_decorate_comment_body():
+    # No link to generic error so the message shouldn't be changed
+    error_message = (
+        "warning: no member named 'ranges' in namespace 'std' [clang-diagnostic-error]"
+    )
+    assert ctr.decorate_check_names(error_message) == error_message
+
+    todo_message = "warning: missing username/bug in TODO [google-readability-todo]"
+    todo_message_decorated = "warning: missing username/bug in TODO [[google-readability-todo](https://clang.llvm.org/extra/clang-tidy/checks/google/readability-todo.html)]"
+    assert ctr.decorate_check_names(todo_message) == todo_message_decorated
+
+    naming_message = "warning: invalid case style for constexpr variable 'foo' [readability-identifier-naming]"
+    naming_message_decorated = "warning: invalid case style for constexpr variable 'foo' [[readability-identifier-naming](https://clang.llvm.org/extra/clang-tidy/checks/readability/identifier-naming.html)]"
+    assert ctr.decorate_check_names(naming_message) == naming_message_decorated
+
+    clang_analyzer_message = "warning: Array access (from variable 'foo') results in a null pointer dereference [clang-analyzer-core.NullDereference]"
+    clang_analyzer_message_decorated = "warning: Array access (from variable 'foo') results in a null pointer dereference [[clang-analyzer-core.NullDereference](https://clang.llvm.org/extra/clang-tidy/checks/clang-analyzer/core.NullDereference.html)]"
+    assert (
+        ctr.decorate_check_names(clang_analyzer_message)
+        == clang_analyzer_message_decorated
+    )
+
+    # Not sure it's necessary to link to prior version documentation especially since we have to map versions such as
+    # "17" to "17.0.1" and "18" to "18.1.0" because no other urls exist
+    # version_message_pre_15_version = "14.0.0"
+    # version_message_pre_15 = "warning: missing username/bug in TODO [google-readability-todo]"
+    # version_message_pre_15_decorated = "warning: missing username/bug in TODO [[google-readability-todo](https://releases.llvm.org/14.0.0/tools/clang/tools/extra/docs/clang-tidy/checks/google-readability-todo.html)]"
+    # assert ctr.decorate_check_names(version_message_pre_15, version_message_pre_15_version) == version_message_pre_15_decorated
+    #
+    # version_message_1500_version = "15.0.0"
+    # version_message_1500 = "warning: missing username/bug in TODO [google-readability-todo]"
+    # version_message_1500_decorated = "warning: missing username/bug in TODO [[google-readability-todo](https://releases.llvm.org/15.0.0/tools/clang/tools/extra/docs/clang-tidy/checks/google/readability-todo.html)]"
+    # assert ctr.decorate_check_names(version_message_1500, version_message_1500_version) == version_message_1500_decorated
+
+
+def test_timing_summary(monkeypatch):
+    monkeypatch.setattr(ctr, "PROFILE_DIR", TEST_DIR / "src/clang-tidy-profile")
+    profiling = ctr.load_and_merge_profiling()
+    assert "time.clang-tidy.total.wall" in profiling["hello.cxx"].keys()
+    assert "time.clang-tidy.total.user" in profiling["hello.cxx"].keys()
+    assert "time.clang-tidy.total.sys" in profiling["hello.cxx"].keys()
+    summary = ctr.make_timing_summary(profiling, datetime.timedelta(seconds=42))
+    assert len(summary.split("\n")) == 22

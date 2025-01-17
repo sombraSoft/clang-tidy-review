@@ -19,7 +19,7 @@ inputs:
     require: false
   clang_tidy_version:
     description: 'Version of clang-tidy to use; one of 14, 15, 16, 17, 18'
-    default: '18'
+    default: '15'
     required: false
   clang_tidy_checks:
     description: 'List of checks'

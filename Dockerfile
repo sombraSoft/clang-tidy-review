@@ -9,6 +9,7 @@ RUN apt update && \
     clang-tidy-15 \
     python3 \
     python3-pip \
+    libomp-dev \
     && rm -rf /var/lib/apt/lists/
 
 COPY . /clang_tidy_review/

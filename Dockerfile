@@ -1,4 +1,4 @@
-FROM openroad/ubuntu22.04-dev:latest
+FROM openroad/ubuntu24.04-dev:latest
 
 RUN apt update && \
     DEBIAN_FRONTEND=noninteractive \

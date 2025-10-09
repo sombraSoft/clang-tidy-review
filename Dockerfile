@@ -5,8 +5,8 @@ RUN apt update && \
     apt-get install -y --no-install-recommends\
     build-essential cmake git \
     tzdata \
-    clang-tidy-14 \
     clang-tidy-15 \
+    clang-tidy-19 \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/
